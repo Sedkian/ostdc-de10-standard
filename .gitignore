@@ -47,3 +47,4 @@ app_software_binary_output/
 .DS_Store
 .vscode/
 .idea/
+*.csv
