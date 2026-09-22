@@ -26,6 +26,10 @@ end entity debug_core_avalon;
 
 architecture rtl of debug_core_avalon is
 
+	-- Define the State Machine enumerations
+    type state_type is (IDLE, ARMED, CAPTURING, COMPLETE);
+    signal state : state_type := IDLE;
+
     -- Register Storage
     signal reg_control  : std_logic_vector(31 downto 0) := (others => '0');
     signal reg_trigger  : std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
@@ -38,6 +42,10 @@ architecture rtl of debug_core_avalon is
     -- Internal BRAM Array (Inferred M10K Block RAM)
     type ram_type is array (0 to BUFFER_DEPTH-1) of std_logic_vector(DATA_WIDTH-1 downto 0);
     signal trace_ram    : ram_type := (others => (others => '0'));
+	 
+    -- Quartus Attributes
+    attribute ramstyle : string;
+    attribute ramstyle of trace_ram : signal is "no_rw_check, M10K";
 
     -- Pointers
     signal write_ptr    : integer range 0 to BUFFER_DEPTH-1 := 0;
@@ -51,11 +59,14 @@ begin
     -- 1. Avalon-MM Register Writes & Soft Reset
     process(clk, reset)
     begin
+		-- Asynchronous Hardware Reset
         if reset = '1' then
             reg_control <= (others => '0');
             reg_trigger <= (others => '0');
+	
+		-- Synchronous Logic
         elsif rising_edge(clk) then
-            -- Self-clearing reset bit handling
+            -- Soft Reset handling (triggered via reg_control bit 1)
             if reg_control(1) = '1' then
                 reg_control(1) <= '0';
             end if;
@@ -73,27 +84,65 @@ begin
     -- 2. Capture Engine & State Machine Logic
     process(clk, reset)
     begin
-        if reset = '1' or reg_control(1) = '1' then
-            write_ptr      <= 0;
-            flag_triggered <= '0';
-            flag_full      <= '0';
+        -- Asynchronous Hardware Reset
+        if reset = '1' then
+            state           <= IDLE;
+            write_ptr       <= 0;
+            flag_triggered  <= '0';
+            flag_full       <= '0';
+
+        -- Synchronous Clocked Logic
         elsif rising_edge(clk) then
-            if flag_armed = '1' and flag_triggered = '0' then
-                -- Write probe inputs into circular buffer
-                trace_ram(write_ptr) <= probe_inputs;
 
-                -- Check Trigger Pattern
-                if probe_inputs = reg_trigger then
-                    flag_triggered <= '1';
-                end if;
+            -- Synchronous Soft Reset (via reg_control bit 1)
+            if reg_control(1) = '1' then
+                state          <= IDLE;
+                write_ptr      <= 0;
+                flag_triggered <= '0';
+                flag_full      <= '0';
 
-                -- Increment Pointer
-                if write_ptr = BUFFER_DEPTH - 1 then
-                    write_ptr <= 0;
-                    flag_full <= '1';
-                else
-                    write_ptr <= write_ptr + 1;
-                end if;
+            else
+                case state is
+
+                    -- IDLE: Wait for Core to be Armed (reg_control bit 0)
+                    when IDLE =>
+                        flag_full <= '0';
+                        if reg_control(0) = '1' then
+                            state          <= ARMED;
+                            write_ptr      <= 0;
+                            flag_triggered <= '0';
+                        end if;
+
+                    -- ARMED: Continuously check probe inputs for trigger match
+                    when ARMED =>
+                        if probe_inputs = reg_trigger then
+                            flag_triggered <= '1';
+                            state          <= CAPTURING;
+                        end if;
+
+                    -- CAPTURING: Log probe inputs to M10K BRAM trace buffer
+                    when CAPTURING =>
+                        if avs_read = '0' then
+                            trace_ram(write_ptr) <= probe_inputs;
+
+                            if write_ptr = BUFFER_DEPTH - 1 then
+                                flag_full <= '1';
+                                state     <= COMPLETE;
+                            else
+                                write_ptr <= write_ptr + 1;
+                            end if;
+                        end if;
+
+                    -- COMPLETE: Capture finished; hold until soft reset or re-armed
+                    when COMPLETE =>
+                        if reg_control(0) = '0' then
+                            state <= IDLE;
+                        end if;
+
+                    when others =>
+                        state <= IDLE;
+
+                end case;
             end if;
         end if;
     end process;
@@ -104,13 +153,19 @@ begin
         if rising_edge(clk) then
             if (avs_chipselect = '1' and avs_read = '1') then
                 case avs_address is
+
+                    -- Address 0x0: Read Status Register [31:3 reserved, 2: Full, 1: Triggered, 0: Armed]
                     when "00" => 
                         avs_readdata <= (31 downto 3 => '0', 
                                          2 => flag_full, 
                                          1 => flag_triggered, 
                                          0 => flag_armed);
+                    
+                    -- Address 0x1: Read Configured Trigger Value
                     when "01" => 
                         avs_readdata <= std_logic_vector(resize(unsigned(reg_trigger), 32));
+
+                    -- Address 0x2: Read Trace RAM (Auto-increments read pointer)
                     when "10" => 
                         avs_readdata <= std_logic_vector(resize(unsigned(trace_ram(read_ptr)), 32));
                         -- Auto-increment read pointer on buffer read
@@ -119,10 +174,14 @@ begin
                         else
                             read_ptr <= read_ptr + 1;
                         end if;
+
+                    -- Address 0x3: Read Trace Buffer Capacity / Depth
                     when "11" => 
                         avs_readdata <= std_logic_vector(to_unsigned(BUFFER_DEPTH, 32));
+
                     when others => 
                         avs_readdata <= (others => '0');
+
                 end case;
             end if;
         end if;
